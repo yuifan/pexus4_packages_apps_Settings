@@ -17,9 +17,11 @@
 package com.android.settings.applications;
 
 import com.android.settings.R;
+import com.android.settings.users.UserUtils;
 
 import android.app.ActivityManager;
 import android.app.ActivityManagerNative;
+import android.app.ActivityThread;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
@@ -27,14 +29,16 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageItemInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
+import android.content.pm.UserInfo;
 import android.content.res.Resources;
-import android.os.Debug;
+import android.graphics.drawable.Drawable;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.Message;
 import android.os.RemoteException;
-import android.os.SystemClock;
+import android.os.UserHandle;
+import android.os.UserManager;
 import android.text.format.Formatter;
 import android.util.Log;
 import android.util.SparseArray;
@@ -51,12 +55,16 @@ import java.util.List;
  * applications/processes/services.
  */
 public class RunningState {
+    static final String TAG = "RunningState";
+    static final boolean DEBUG_COMPARE = false;
+
     static Object sGlobalLock = new Object();
     static RunningState sInstance;
 
-    static final int MSG_UPDATE_CONTENTS = 1;
-    static final int MSG_REFRESH_UI = 2;
-    static final int MSG_UPDATE_TIME = 3;
+    static final int MSG_RESET_CONTENTS = 1;
+    static final int MSG_UPDATE_CONTENTS = 2;
+    static final int MSG_REFRESH_UI = 3;
+    static final int MSG_UPDATE_TIME = 4;
 
     static final long TIME_UPDATE_DELAY = 1000;
     static final long CONTENTS_UPDATE_DELAY = 2000;
@@ -66,8 +74,12 @@ public class RunningState {
     final Context mApplicationContext;
     final ActivityManager mAm;
     final PackageManager mPm;
+    final UserManager mUm;
+    final int mMyUserId;
 
     OnRefreshUiListener mRefreshUiListener;
+
+    final InterestingConfigChanges mInterestingConfigChanges = new InterestingConfigChanges();
 
     // Processes that are hosting a service we are interested in, organized
     // by uid and name.  Note that this mapping does not change even across
@@ -98,9 +110,90 @@ public class RunningState {
     
     // All processes, used for retrieving memory information.
     final ArrayList<ProcessItem> mAllProcessItems = new ArrayList<ProcessItem>();
-    
+
+    // If there are other users on the device, these are the merged items
+    // representing all items that would be put in mMergedItems for that user.
+    final SparseArray<MergedItem> mOtherUserMergedItems = new SparseArray<MergedItem>();
+
+    // If there are other users on the device, these are the merged items
+    // representing all items that would be put in mUserBackgroundItems for that user.
+    final SparseArray<MergedItem> mOtherUserBackgroundItems = new SparseArray<MergedItem>();
+
+    // Tracking of information about users.
+    final SparseArray<UserState> mUsers = new SparseArray<UserState>();
+
+    static class AppProcessInfo {
+        final ActivityManager.RunningAppProcessInfo info;
+        boolean hasServices;
+        boolean hasForegroundServices;
+
+        AppProcessInfo(ActivityManager.RunningAppProcessInfo _info) {
+            info = _info;
+        }
+    }
+
+    // Temporary structure used when updating above information.
+    final SparseArray<AppProcessInfo> mTmpAppProcesses = new SparseArray<AppProcessInfo>();
+
     int mSequence = 0;
-    
+
+    final Comparator<RunningState.MergedItem> mBackgroundComparator
+        = new Comparator<RunningState.MergedItem>() {
+            @Override
+            public int compare(MergedItem lhs, MergedItem rhs) {
+                if (DEBUG_COMPARE) {
+                    Log.i(TAG, "Comparing " + lhs + " with " + rhs);
+                    Log.i(TAG, "     Proc " + lhs.mProcess + " with " + rhs.mProcess);
+                    Log.i(TAG, "   UserId " + lhs.mUserId + " with " + rhs.mUserId);
+                }
+                if (lhs.mUserId != rhs.mUserId) {
+                    if (lhs.mUserId == mMyUserId) return -1;
+                    if (rhs.mUserId == mMyUserId) return 1;
+                    return lhs.mUserId < rhs.mUserId ? -1 : 1;
+                }
+                if (lhs.mProcess == rhs.mProcess) {
+                    if (lhs.mLabel == rhs.mLabel) {
+                        return 0;
+                    }
+                    return lhs.mLabel != null ? lhs.mLabel.compareTo(rhs.mLabel) : -1;
+                }
+                if (lhs.mProcess == null) return -1;
+                if (rhs.mProcess == null) return 1;
+                if (DEBUG_COMPARE) Log.i(TAG, "    Label " + lhs.mProcess.mLabel
+                        + " with " + rhs.mProcess.mLabel);
+                final ActivityManager.RunningAppProcessInfo lhsInfo
+                        = lhs.mProcess.mRunningProcessInfo;
+                final ActivityManager.RunningAppProcessInfo rhsInfo
+                        = rhs.mProcess.mRunningProcessInfo;
+                final boolean lhsBg = lhsInfo.importance
+                        >= ActivityManager.RunningAppProcessInfo.IMPORTANCE_BACKGROUND;
+                final boolean rhsBg = rhsInfo.importance
+                        >= ActivityManager.RunningAppProcessInfo.IMPORTANCE_BACKGROUND;
+                        if (DEBUG_COMPARE) Log.i(TAG, "       Bg " + lhsBg + " with " + rhsBg);
+                if (lhsBg != rhsBg) {
+                    return lhsBg ? 1 : -1;
+                }
+                final boolean lhsA = (lhsInfo.flags
+                        & ActivityManager.RunningAppProcessInfo.FLAG_HAS_ACTIVITIES) != 0;
+                final boolean rhsA = (rhsInfo.flags
+                        & ActivityManager.RunningAppProcessInfo.FLAG_HAS_ACTIVITIES) != 0;
+                if (DEBUG_COMPARE) Log.i(TAG, "      Act " + lhsA + " with " + rhsA);
+                if (lhsA != rhsA) {
+                    return lhsA ? -1 : 1;
+                }
+                if (DEBUG_COMPARE) Log.i(TAG, "      Lru " + lhsInfo.lru + " with " + rhsInfo.lru);
+                if (lhsInfo.lru != rhsInfo.lru) {
+                    return lhsInfo.lru < rhsInfo.lru ? -1 : 1;
+                }
+                if (lhs.mProcess.mLabel == rhs.mProcess.mLabel) {
+                    return 0;
+                }
+                if (lhs.mProcess.mLabel == null) return 1;
+                if (rhs.mProcess.mLabel == null) return -1;
+                return lhs.mProcess.mLabel.compareTo(rhs.mProcess.mLabel);
+            }
+    };
+
     // ----- following protected by mLock -----
     
     // Lock for protecting the state that will be shared between the
@@ -114,6 +207,7 @@ public class RunningState {
     ArrayList<BaseItem> mItems = new ArrayList<BaseItem>();
     ArrayList<MergedItem> mMergedItems = new ArrayList<MergedItem>();
     ArrayList<MergedItem> mBackgroundItems = new ArrayList<MergedItem>();
+    ArrayList<MergedItem> mUserBackgroundItems = new ArrayList<MergedItem>();
     
     int mNumBackgroundProcesses;
     long mBackgroundProcessMemory;
@@ -133,6 +227,9 @@ public class RunningState {
         @Override
         public void handleMessage(Message msg) {
             switch (msg.what) {
+                case MSG_RESET_CONTENTS:
+                    reset();
+                    break;
                 case MSG_UPDATE_CONTENTS:
                     synchronized (mLock) {
                         if (!mResumed) {
@@ -194,25 +291,40 @@ public class RunningState {
         public void onRefreshUi(int what);
     }
 
+    static class UserState {
+        UserInfo mInfo;
+        String mLabel;
+        Drawable mIcon;
+    }
+
     static class BaseItem {
         final boolean mIsProcess;
-        
+        final int mUserId;
+
         PackageItemInfo mPackageInfo;
         CharSequence mDisplayLabel;
         String mLabel;
         String mDescription;
-        
+
         int mCurSeq;
-        
+
         long mActiveSince;
         long mSize;
         String mSizeStr;
         String mCurSizeStr;
         boolean mNeedDivider;
         boolean mBackground;
-        
-        public BaseItem(boolean isProcess) {
+
+        public BaseItem(boolean isProcess, int userId) {
             mIsProcess = isProcess;
+            mUserId = userId;
+        }
+
+        public Drawable loadIcon(Context context, RunningState state) {
+            if (mPackageInfo != null) {
+                return mPackageInfo.loadIcon(state.mPm);
+            }
+            return null;
         }
     }
 
@@ -223,8 +335,8 @@ public class RunningState {
         
         MergedItem mMergedItem;
         
-        public ServiceItem() {
-            super(false);
+        public ServiceItem(int userId) {
+            super(false, userId);
         }
     }
 
@@ -245,14 +357,16 @@ public class RunningState {
         ActivityManager.RunningAppProcessInfo mRunningProcessInfo;
         
         MergedItem mMergedItem;
-        
+
+        boolean mInteresting;
+
         // Purely for sorting.
         boolean mIsSystem;
         boolean mIsStarted;
         long mActiveSince;
         
         public ProcessItem(Context context, int uid, String processName) {
-            super(true);
+            super(true, UserHandle.getUserId(uid));
             mDescription = context.getResources().getString(
                     R.string.service_process_name, processName);
             mUid = uid;
@@ -265,7 +379,8 @@ public class RunningState {
             }
             
             try {
-                ApplicationInfo ai = pm.getApplicationInfo(mProcessName, 0);
+                ApplicationInfo ai = pm.getApplicationInfo(mProcessName,
+                        PackageManager.GET_UNINSTALLED_PACKAGES);
                 if (ai.uid == mUid) {
                     mDisplayLabel = ai.loadLabel(pm);
                     mLabel = mDisplayLabel.toString();
@@ -282,7 +397,8 @@ public class RunningState {
             // If there is one package with this uid, that is what we want.
             if (pkgs.length == 1) {
                 try {
-                    ApplicationInfo ai = pm.getApplicationInfo(pkgs[0], 0);
+                    ApplicationInfo ai = pm.getApplicationInfo(pkgs[0],
+                            PackageManager.GET_UNINSTALLED_PACKAGES);
                     mDisplayLabel = ai.loadLabel(pm);
                     mLabel = mDisplayLabel.toString();
                     mPackageInfo = ai;
@@ -313,8 +429,9 @@ public class RunningState {
             // If still don't have anything to display, just use the
             // service info.
             if (mServices.size() > 0) {
-                mPackageInfo = mServices.values().iterator().next()
+                ApplicationInfo ai = mServices.values().iterator().next()
                         .mServiceInfo.applicationInfo;
+                mPackageInfo = ai;
                 mDisplayLabel = mPackageInfo.loadLabel(pm);
                 mLabel = mDisplayLabel.toString();
                 return;
@@ -322,7 +439,8 @@ public class RunningState {
             
             // Finally... whatever, just pick the first package's name.
             try {
-                ApplicationInfo ai = pm.getApplicationInfo(pkgs[0], 0);
+                ApplicationInfo ai = pm.getApplicationInfo(pkgs[0],
+                        PackageManager.GET_UNINSTALLED_PACKAGES);
                 mDisplayLabel = ai.loadLabel(pm);
                 mLabel = mDisplayLabel.toString();
                 mPackageInfo = ai;
@@ -330,20 +448,27 @@ public class RunningState {
             } catch (PackageManager.NameNotFoundException e) {
             }
         }
-        
-        boolean updateService(Context context,
-                ActivityManager.RunningServiceInfo service) {
+
+        boolean updateService(Context context, ActivityManager.RunningServiceInfo service) {
             final PackageManager pm = context.getPackageManager();
-            
+
             boolean changed = false;
             ServiceItem si = mServices.get(service.service);
             if (si == null) {
                 changed = true;
-                si = new ServiceItem();
+                si = new ServiceItem(mUserId);
                 si.mRunningService = service;
                 try {
-                    si.mServiceInfo = pm.getServiceInfo(service.service, 0);
-                } catch (PackageManager.NameNotFoundException e) {
+                    si.mServiceInfo = ActivityThread.getPackageManager().getServiceInfo(
+                            service.service, PackageManager.GET_UNINSTALLED_PACKAGES,
+                            UserHandle.getUserId(service.uid));
+
+                    if (si.mServiceInfo == null) {
+                        Log.d("RunningService", "getServiceInfo returned null for: "
+                                + service.service);
+                        return false;
+                    }
+                } catch (RemoteException e) {
                 }
                 si.mDisplayLabel = makeLabel(pm,
                         si.mRunningService.service.getClassName(), si.mServiceInfo);
@@ -383,8 +508,8 @@ public class RunningState {
             return changed;
         }
         
-        boolean updateSize(Context context, Debug.MemoryInfo mem, int curSeq) {
-            mSize = ((long)mem.getTotalPss()) * 1024;
+        boolean updateSize(Context context, long pss, int curSeq) {
+            mSize = pss * 1024;
             if (mCurSeq == curSeq) {
                 String sizeStr = Formatter.formatShortFileSize(
                         context, mSize);
@@ -437,55 +562,96 @@ public class RunningState {
 
     static class MergedItem extends BaseItem {
         ProcessItem mProcess;
+        UserState mUser;
         final ArrayList<ProcessItem> mOtherProcesses = new ArrayList<ProcessItem>();
         final ArrayList<ServiceItem> mServices = new ArrayList<ServiceItem>();
+        final ArrayList<MergedItem> mChildren = new ArrayList<MergedItem>();
         
         private int mLastNumProcesses = -1, mLastNumServices = -1;
 
-        MergedItem() {
-            super(false);
+        MergedItem(int userId) {
+            super(false, userId);
         }
-        
+
+        private void setDescription(Context context, int numProcesses, int numServices) {
+            if (mLastNumProcesses != numProcesses || mLastNumServices != numServices) {
+                mLastNumProcesses = numProcesses;
+                mLastNumServices = numServices;
+                int resid = R.string.running_processes_item_description_s_s;
+                if (numProcesses != 1) {
+                    resid = numServices != 1
+                            ? R.string.running_processes_item_description_p_p
+                            : R.string.running_processes_item_description_p_s;
+                } else if (numServices != 1) {
+                    resid = R.string.running_processes_item_description_s_p;
+                }
+                mDescription = context.getResources().getString(resid, numProcesses,
+                        numServices);
+            }
+        }
+
         boolean update(Context context, boolean background) {
-            mPackageInfo = mProcess.mPackageInfo;
-            mDisplayLabel = mProcess.mDisplayLabel;
-            mLabel = mProcess.mLabel;
             mBackground = background;
-            
-            if (!mBackground) {
-                int numProcesses = (mProcess.mPid > 0 ? 1 : 0) + mOtherProcesses.size();
-                int numServices = mServices.size();
-                if (mLastNumProcesses != numProcesses || mLastNumServices != numServices) {
-                    mLastNumProcesses = numProcesses;
-                    mLastNumServices = numServices;
-                    int resid = R.string.running_processes_item_description_s_s;
-                    if (numProcesses != 1) {
-                        resid = numServices != 1
-                                ? R.string.running_processes_item_description_p_p
-                                : R.string.running_processes_item_description_p_s;
-                    } else if (numServices != 1) {
-                        resid = R.string.running_processes_item_description_s_p;
+
+            if (mUser != null) {
+                // This is a merged item that contains a child collection
+                // of items...  that is, it is an entire user, containing
+                // everything associated with that user.  So set it up as such.
+                // For concrete stuff we need about the process of this item,
+                // we will just use the info from the first child.
+                MergedItem child0 = mChildren.get(0);
+                mPackageInfo = child0.mProcess.mPackageInfo;
+                mLabel = mUser != null ? mUser.mLabel : null;
+                mDisplayLabel = mLabel;
+                int numProcesses = 0;
+                int numServices = 0;
+                mActiveSince = -1;
+                for (int i=0; i<mChildren.size(); i++) {
+                    MergedItem child = mChildren.get(i);
+                    numProcesses += child.mLastNumProcesses;
+                    numServices += child.mLastNumServices;
+                    if (child.mActiveSince >= 0 && mActiveSince < child.mActiveSince) {
+                        mActiveSince = child.mActiveSince;
                     }
-                    mDescription = context.getResources().getString(resid, numProcesses,
-                            numServices);
+                }
+                if (!mBackground) {
+                    setDescription(context, numProcesses, numServices);
+                }
+            } else {
+                mPackageInfo = mProcess.mPackageInfo;
+                mDisplayLabel = mProcess.mDisplayLabel;
+                mLabel = mProcess.mLabel;
+                
+                if (!mBackground) {
+                    setDescription(context, (mProcess.mPid > 0 ? 1 : 0) + mOtherProcesses.size(),
+                            mServices.size());
+                }
+                
+                mActiveSince = -1;
+                for (int i=0; i<mServices.size(); i++) {
+                    ServiceItem si = mServices.get(i);
+                    if (si.mActiveSince >= 0 && mActiveSince < si.mActiveSince) {
+                        mActiveSince = si.mActiveSince;
+                    }
                 }
             }
-            
-            mActiveSince = -1;
-            for (int i=0; i<mServices.size(); i++) {
-                ServiceItem si = mServices.get(i);
-                if (si.mActiveSince >= 0 && mActiveSince < si.mActiveSince) {
-                    mActiveSince = si.mActiveSince;
-                }
-            }
-            
+
             return false;
         }
         
         boolean updateSize(Context context) {
-            mSize = mProcess.mSize;
-            for (int i=0; i<mOtherProcesses.size(); i++) {
-                mSize += mOtherProcesses.get(i).mSize;
+            if (mUser != null) {
+                mSize = 0;
+                for (int i=0; i<mChildren.size(); i++) {
+                    MergedItem child = mChildren.get(i);
+                    child.updateSize(context);
+                    mSize += child.mSize;
+                }
+            } else {
+                mSize = mProcess.mSize;
+                for (int i=0; i<mOtherProcesses.size(); i++) {
+                    mSize += mOtherProcesses.get(i).mSize;
+                }
             }
             
             String sizeStr = Formatter.formatShortFileSize(
@@ -499,10 +665,26 @@ public class RunningState {
             }
             return false;
         }
+
+        public Drawable loadIcon(Context context, RunningState state) {
+            if (mUser == null) {
+                return super.loadIcon(context, state);
+            }
+            if (mUser.mIcon != null) {
+                return mUser.mIcon.getConstantState().newDrawable();
+            }
+            return context.getResources().getDrawable(
+                    com.android.internal.R.drawable.ic_menu_cc);
+        }
     }
-    
-    static class ServiceProcessComparator implements Comparator<ProcessItem> {
+
+    class ServiceProcessComparator implements Comparator<ProcessItem> {
         public int compare(ProcessItem object1, ProcessItem object2) {
+            if (object1.mUserId != object2.mUserId) {
+                if (object1.mUserId == mMyUserId) return -1;
+                if (object2.mUserId == mMyUserId) return 1;
+                return object1.mUserId < object2.mUserId ? -1 : 1;
+            }
             if (object1.mIsStarted != object2.mIsStarted) {
                 // Non-started processes go last.
                 return object1.mIsStarted ? -1 : 1;
@@ -551,6 +733,8 @@ public class RunningState {
         mApplicationContext = context.getApplicationContext();
         mAm = (ActivityManager)mApplicationContext.getSystemService(Context.ACTIVITY_SERVICE);
         mPm = mApplicationContext.getPackageManager();
+        mUm = (UserManager)mApplicationContext.getSystemService(Context.USER_SERVICE);
+        mMyUserId = UserHandle.myUserId();
         mResumed = false;
         mBackgroundThread = new HandlerThread("RunningState:Background");
         mBackgroundThread.start();
@@ -561,6 +745,12 @@ public class RunningState {
         synchronized (mLock) {
             mResumed = true;
             mRefreshUiListener = listener;
+            if (mInterestingConfigChanges.applyNewConfig(mApplicationContext.getResources())) {
+                mHaveData = false;
+                mBackgroundHandler.removeMessages(MSG_RESET_CONTENTS);
+                mBackgroundHandler.removeMessages(MSG_UPDATE_CONTENTS);
+                mBackgroundHandler.sendEmptyMessage(MSG_RESET_CONTENTS);
+            }
             if (!mBackgroundHandler.hasMessages(MSG_UPDATE_CONTENTS)) {
                 mBackgroundHandler.sendEmptyMessage(MSG_UPDATE_CONTENTS);
             }
@@ -605,12 +795,55 @@ public class RunningState {
             return true;
         }
         if ((pi.flags&ActivityManager.RunningAppProcessInfo.FLAG_PERSISTENT) == 0
-                && pi.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
+                && pi.importance >= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
+                && pi.importance < ActivityManager.RunningAppProcessInfo.IMPORTANCE_CANT_SAVE_STATE
                 && pi.importanceReasonCode
                         == ActivityManager.RunningAppProcessInfo.REASON_UNKNOWN) {
             return true;
         }
         return false;
+    }
+
+    private void reset() {
+        mServiceProcessesByName.clear();
+        mServiceProcessesByPid.clear();
+        mInterestingProcesses.clear();
+        mRunningProcesses.clear();
+        mProcessItems.clear();
+        mAllProcessItems.clear();
+        mUsers.clear();
+    }
+
+    private void addOtherUserItem(Context context, ArrayList<MergedItem> newMergedItems,
+            SparseArray<MergedItem> userItems, MergedItem newItem) {
+        MergedItem userItem = userItems.get(newItem.mUserId);
+        boolean first = userItem == null || userItem.mCurSeq != mSequence;
+        if (first) {
+            if (userItem == null) {
+                userItem = new MergedItem(newItem.mUserId);
+                userItems.put(newItem.mUserId, userItem);
+            } else {
+                userItem.mChildren.clear();
+            }
+            userItem.mCurSeq = mSequence;
+            if ((userItem.mUser=mUsers.get(newItem.mUserId)) == null) {
+                userItem.mUser = new UserState();
+                UserInfo info = mUm.getUserInfo(newItem.mUserId);
+                userItem.mUser.mInfo = info;
+                if (info != null) {
+                    userItem.mUser.mIcon = UserUtils.getUserIcon(mUm, info,
+                            context.getResources());
+                }
+                String name = info != null ? info.name : null;
+                if (name == null) {
+                    name = Integer.toString(info.id);
+                }
+                userItem.mUser.mLabel = context.getResources().getString(
+                        R.string.running_process_item_user_label, name);
+            }
+            newMergedItems.add(userItem);
+        }
+        userItem.mChildren.add(newItem);
     }
 
     private boolean update(Context context, ActivityManager am) {
@@ -619,25 +852,97 @@ public class RunningState {
         mSequence++;
         
         boolean changed = false;
-        
+
+        // Retrieve list of services, filtering out anything that definitely
+        // won't be shown in the UI.
         List<ActivityManager.RunningServiceInfo> services 
                 = am.getRunningServices(MAX_SERVICES);
-        final int NS = services != null ? services.size() : 0;
+        int NS = services != null ? services.size() : 0;
         for (int i=0; i<NS; i++) {
             ActivityManager.RunningServiceInfo si = services.get(i);
             // We are not interested in services that have not been started
             // and don't have a known client, because
             // there is nothing the user can do about them.
             if (!si.started && si.clientLabel == 0) {
+                services.remove(i);
+                i--;
+                NS--;
                 continue;
             }
             // We likewise don't care about services running in a
             // persistent process like the system or phone.
             if ((si.flags&ActivityManager.RunningServiceInfo.FLAG_PERSISTENT_PROCESS)
                     != 0) {
+                services.remove(i);
+                i--;
+                NS--;
                 continue;
             }
-            
+        }
+
+        // Retrieve list of running processes, organizing them into a sparse
+        // array for easy retrieval.
+        List<ActivityManager.RunningAppProcessInfo> processes
+                = am.getRunningAppProcesses();
+        final int NP = processes != null ? processes.size() : 0;
+        mTmpAppProcesses.clear();
+        for (int i=0; i<NP; i++) {
+            ActivityManager.RunningAppProcessInfo pi = processes.get(i);
+            mTmpAppProcesses.put(pi.pid, new AppProcessInfo(pi));
+        }
+
+        // Initial iteration through running services to collect per-process
+        // info about them.
+        for (int i=0; i<NS; i++) {
+            ActivityManager.RunningServiceInfo si = services.get(i);
+            if (si.restarting == 0 && si.pid > 0) {
+                AppProcessInfo ainfo = mTmpAppProcesses.get(si.pid);
+                if (ainfo != null) {
+                    ainfo.hasServices = true;
+                    if (si.foreground) {
+                        ainfo.hasForegroundServices = true;
+                    }
+                }
+            }
+        }
+
+        // Update state we are maintaining about process that are running services.
+        for (int i=0; i<NS; i++) {
+            ActivityManager.RunningServiceInfo si = services.get(i);
+
+            // If this service's process is in use at a higher importance
+            // due to another process bound to one of its services, then we
+            // won't put it in the top-level list of services.  Instead we
+            // want it to be included in the set of processes that the other
+            // process needs.
+            if (si.restarting == 0 && si.pid > 0) {
+                AppProcessInfo ainfo = mTmpAppProcesses.get(si.pid);
+                if (ainfo != null && !ainfo.hasForegroundServices) {
+                    // This process does not have any foreground services.
+                    // If its importance is greater than the service importance
+                    // then there is something else more significant that is
+                    // keeping it around that it should possibly be included as
+                    // a part of instead of being shown by itself.
+                    if (ainfo.info.importance
+                            < ActivityManager.RunningAppProcessInfo.IMPORTANCE_SERVICE) {
+                        // Follow process chain to see if there is something
+                        // else that could be shown
+                        boolean skip = false;
+                        ainfo = mTmpAppProcesses.get(ainfo.info.importanceReasonPid);
+                        while (ainfo != null) {
+                            if (ainfo.hasServices || isInterestingProcess(ainfo.info)) {
+                                skip = true;
+                                break;
+                            }
+                            ainfo = mTmpAppProcesses.get(ainfo.info.importanceReasonPid);
+                        }
+                        if (skip) {
+                            continue;
+                        }
+                    }
+                }
+            }
+
             HashMap<String, ProcessItem> procs = mServiceProcessesByName.get(si.uid);
             if (procs == null) {
                 procs = new HashMap<String, ProcessItem>();
@@ -672,9 +977,6 @@ public class RunningState {
         
         // Now update the map of other processes that are running (but
         // don't have services actively running inside them).
-        List<ActivityManager.RunningAppProcessInfo> processes
-                = am.getRunningAppProcesses();
-        final int NP = processes != null ? processes.size() : 0;
         for (int i=0; i<NP; i++) {
             ActivityManager.RunningAppProcessInfo pi = processes.get(i);
             ProcessItem proc = mServiceProcessesByPid.get(pi.pid);
@@ -698,17 +1000,20 @@ public class RunningState {
                     mInterestingProcesses.add(proc);
                 }
                 proc.mCurSeq = mSequence;
+                proc.mInteresting = true;
                 proc.ensureLabel(pm);
+            } else {
+                proc.mInteresting = false;
             }
             
             proc.mRunningSeq = mSequence;
             proc.mRunningProcessInfo = pi;
         }
-        
+
         // Build the chains from client processes to the process they are
         // dependent on; also remove any old running processes.
         int NRP = mRunningProcesses.size();
-        for (int i=0; i<NRP; i++) {
+        for (int i = 0; i < NRP;) {
             ProcessItem proc = mRunningProcesses.valueAt(i);
             if (proc.mRunningSeq == mSequence) {
                 int clientPid = proc.mRunningProcessInfo.importanceReasonPid;
@@ -726,9 +1031,11 @@ public class RunningState {
                     // we will detect the change.
                     proc.mClient = null;
                 }
+                i++;
             } else {
                 changed = true;
                 mRunningProcesses.remove(mRunningProcesses.keyAt(i));
+                NRP--;
             }
         }
         
@@ -736,7 +1043,7 @@ public class RunningState {
         int NHP = mInterestingProcesses.size();
         for (int i=0; i<NHP; i++) {
             ProcessItem proc = mInterestingProcesses.get(i);
-            if (mRunningProcesses.get(proc.mPid) == null) {
+            if (!proc.mInteresting || mRunningProcesses.get(proc.mPid) == null) {
                 changed = true;
                 mInterestingProcesses.remove(i);
                 i--;
@@ -756,6 +1063,7 @@ public class RunningState {
         }
         
         // Look for services and their primary processes that no longer exist...
+        ArrayList<Integer> uidToDelete = null;
         for (int i=0; i<mServiceProcessesByName.size(); i++) {
             HashMap<String, ProcessItem> procs = mServiceProcessesByName.valueAt(i);
             Iterator<ProcessItem> pit = procs.values().iterator();
@@ -772,7 +1080,10 @@ public class RunningState {
                     changed = true;
                     pit.remove();
                     if (procs.size() == 0) {
-                        mServiceProcessesByName.remove(mServiceProcessesByName.keyAt(i));
+                        if (uidToDelete == null) {
+                            uidToDelete = new ArrayList<Integer>();
+                        }
+                        uidToDelete.add(mServiceProcessesByName.keyAt(i));
                     }
                     if (pi.mPid != 0) {
                         mServiceProcessesByPid.remove(pi.mPid);
@@ -790,6 +1101,13 @@ public class RunningState {
             }
         }
         
+        if (uidToDelete != null) {
+            for (int i = 0; i < uidToDelete.size(); i++) {
+                int uid = uidToDelete.get(i);
+                mServiceProcessesByName.remove(uid);
+            }
+        }
+
         if (changed) {
             // First determine an order for the services.
             ArrayList<ProcessItem> sortedProcesses = new ArrayList<ProcessItem>();
@@ -820,6 +1138,7 @@ public class RunningState {
             
             ArrayList<BaseItem> newItems = new ArrayList<BaseItem>();
             ArrayList<MergedItem> newMergedItems = new ArrayList<MergedItem>();
+            SparseArray<MergedItem> otherUsers = null;
             mProcessItems.clear();
             for (int i=0; i<sortedProcesses.size(); i++) {
                 ProcessItem pi = sortedProcesses.get(i);
@@ -855,7 +1174,7 @@ public class RunningState {
                 if (!haveAllMerged || mergedItem == null
                         || mergedItem.mServices.size() != pi.mServices.size()) {
                     // Whoops, we need to build a new MergedItem!
-                    mergedItem = new MergedItem();
+                    mergedItem = new MergedItem(pi.mUserId);
                     for (ServiceItem si : pi.mServices.values()) {
                         mergedItem.mServices.add(si);
                         si.mMergedItem = mergedItem;
@@ -868,9 +1187,13 @@ public class RunningState {
                 }
                 
                 mergedItem.update(context, false);
-                newMergedItems.add(mergedItem);
+                if (mergedItem.mUserId != mMyUserId) {
+                    addOtherUserItem(context, newMergedItems, mOtherUserMergedItems, mergedItem);
+                } else {
+                    newMergedItems.add(mergedItem);
+                }
             }
-            
+
             // Finally, interesting processes need to be shown and will
             // go at the top.
             NHP = mInterestingProcesses.size();
@@ -878,15 +1201,30 @@ public class RunningState {
                 ProcessItem proc = mInterestingProcesses.get(i);
                 if (proc.mClient == null && proc.mServices.size() <= 0) {
                     if (proc.mMergedItem == null) {
-                        proc.mMergedItem = new MergedItem();
+                        proc.mMergedItem = new MergedItem(proc.mUserId);
                         proc.mMergedItem.mProcess = proc;
                     }
                     proc.mMergedItem.update(context, false);
-                    newMergedItems.add(0, proc.mMergedItem);
+                    if (proc.mMergedItem.mUserId != mMyUserId) {
+                        addOtherUserItem(context, newMergedItems, mOtherUserMergedItems,
+                                proc.mMergedItem);
+                    } else {
+                        newMergedItems.add(0, proc.mMergedItem);
+                    }
                     mProcessItems.add(proc);
                 }
             }
-            
+
+            // Finally finally, user aggregated merged items need to be
+            // updated now that they have all of their children.
+            final int NU = mOtherUserMergedItems.size();
+            for (int i=0; i<NU; i++) {
+                MergedItem user = mOtherUserMergedItems.valueAt(i);
+                if (user.mCurSeq == mSequence) {
+                    user.update(context, false);
+                }
+            }
+
             synchronized (mLock) {
                 mItems = newItems;
                 mMergedItems = newMergedItems;
@@ -927,18 +1265,20 @@ public class RunningState {
         long foregroundProcessMemory = 0;
         long serviceProcessMemory = 0;
         ArrayList<MergedItem> newBackgroundItems = null;
+        ArrayList<MergedItem> newUserBackgroundItems = null;
+        boolean diffUsers = false;
         try {
             final int numProc = mAllProcessItems.size();
             int[] pids = new int[numProc];
             for (int i=0; i<numProc; i++) {
                 pids[i] = mAllProcessItems.get(i).mPid;
             }
-            Debug.MemoryInfo[] mem = ActivityManagerNative.getDefault()
-                    .getProcessMemoryInfo(pids);
+            long[] pss = ActivityManagerNative.getDefault()
+                    .getProcessPss(pids);
             int bgIndex = 0;
             for (int i=0; i<pids.length; i++) {
                 ProcessItem proc = mAllProcessItems.get(i);
-                changed |= proc.updateSize(context, mem[i], mSequence);
+                changed |= proc.updateSize(context, pss[i], mSequence);
                 if (proc.mCurSeq == mSequence) {
                     serviceProcessMemory += proc.mSize;
                 } else if (proc.mRunningProcessInfo.importance >=
@@ -946,18 +1286,22 @@ public class RunningState {
                     backgroundProcessMemory += proc.mSize;
                     MergedItem mergedItem;
                     if (newBackgroundItems != null) {
-                        mergedItem = proc.mMergedItem = new MergedItem();
+                        mergedItem = proc.mMergedItem = new MergedItem(proc.mUserId);
                         proc.mMergedItem.mProcess = proc;
+                        diffUsers |= mergedItem.mUserId != mMyUserId;
                         newBackgroundItems.add(mergedItem);
                     } else {
                         if (bgIndex >= mBackgroundItems.size()
                                 || mBackgroundItems.get(bgIndex).mProcess != proc) {
                             newBackgroundItems = new ArrayList<MergedItem>(numBackgroundProcesses);
                             for (int bgi=0; bgi<bgIndex; bgi++) {
-                                newBackgroundItems.add(mBackgroundItems.get(bgi));
+                                mergedItem = mBackgroundItems.get(bgi);
+                                diffUsers |= mergedItem.mUserId != mMyUserId;
+                                newBackgroundItems.add(mergedItem);
                             }
-                            mergedItem = proc.mMergedItem = new MergedItem();
+                            mergedItem = proc.mMergedItem = new MergedItem(proc.mUserId);
                             proc.mMergedItem.mProcess = proc;
+                            diffUsers |= mergedItem.mUserId != mMyUserId;
                             newBackgroundItems.add(mergedItem);
                         } else {
                             mergedItem = mBackgroundItems.get(bgIndex);
@@ -975,11 +1319,46 @@ public class RunningState {
         }
         
         if (newBackgroundItems == null) {
-            // One or more at the bottom may no longer exit.
+            // One or more at the bottom may no longer exist.
             if (mBackgroundItems.size() > numBackgroundProcesses) {
                 newBackgroundItems = new ArrayList<MergedItem>(numBackgroundProcesses);
                 for (int bgi=0; bgi<numBackgroundProcesses; bgi++) {
-                    newBackgroundItems.add(mBackgroundItems.get(bgi));
+                    MergedItem mergedItem = mBackgroundItems.get(bgi);
+                    diffUsers |= mergedItem.mUserId != mMyUserId;
+                    newBackgroundItems.add(mergedItem);
+                }
+            }
+        }
+
+        if (newBackgroundItems != null) {
+            // The background items have changed; we need to re-build the
+            // per-user items.
+            if (!diffUsers) {
+                // Easy: there are no other users, we can just use the same array.
+                newUserBackgroundItems = newBackgroundItems;
+            } else {
+                // We now need to re-build the per-user list so that background
+                // items for users are collapsed together.
+                newUserBackgroundItems = new ArrayList<MergedItem>();
+                final int NB = newBackgroundItems.size();
+                for (int i=0; i<NB; i++) {
+                    MergedItem mergedItem = newBackgroundItems.get(i);
+                    if (mergedItem.mUserId != mMyUserId) {
+                        addOtherUserItem(context, newUserBackgroundItems,
+                                mOtherUserBackgroundItems, mergedItem);
+                    } else {
+                        newUserBackgroundItems.add(mergedItem);
+                    }
+                }
+                // And user aggregated merged items need to be
+                // updated now that they have all of their children.
+                final int NU = mOtherUserBackgroundItems.size();
+                for (int i=0; i<NU; i++) {
+                    MergedItem user = mOtherUserBackgroundItems.valueAt(i);
+                    if (user.mCurSeq == mSequence) {
+                        user.update(context, true);
+                        user.updateSize(context);
+                    }
                 }
             }
         }
@@ -997,6 +1376,7 @@ public class RunningState {
             mServiceProcessMemory = serviceProcessMemory;
             if (newBackgroundItems != null) {
                 mBackgroundItems = newBackgroundItems;
+                mUserBackgroundItems = newUserBackgroundItems;
                 if (mWatchingBackgroundItems) {
                     changed = true;
                 }
@@ -1030,7 +1410,7 @@ public class RunningState {
 
     ArrayList<MergedItem> getCurrentBackgroundItems() {
         synchronized (mLock) {
-            return mBackgroundItems;
+            return mUserBackgroundItems;
         }
     }
 }

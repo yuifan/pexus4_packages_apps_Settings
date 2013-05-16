@@ -144,7 +144,7 @@ public class QuickLaunchSettings extends PreferenceActivity implements
                 // Create the dialog for clearing a shortcut
                 return new AlertDialog.Builder(this)
                         .setTitle(getString(R.string.quick_launch_clear_dialog_title))
-                        .setIcon(android.R.drawable.ic_dialog_alert)
+                        .setIconAttribute(android.R.attr.alertDialogIcon)
                         .setMessage(getString(R.string.quick_launch_clear_dialog_message,
                                 mClearDialogShortcut, mClearDialogBookmarkTitle))
                         .setPositiveButton(R.string.quick_launch_clear_ok_button, this)
@@ -204,7 +204,7 @@ public class QuickLaunchSettings extends PreferenceActivity implements
         return true;
     }
 
-    public boolean onItemLongClick(AdapterView parent, View view, int position, long id) {
+    public boolean onItemLongClick(AdapterView<?> parent, View view, int position, long id) {
         
         // Open the clear shortcut dialog
         Preference pref = (Preference) getPreferenceScreen().getRootAdapter().getItem(position);
@@ -263,7 +263,7 @@ public class QuickLaunchSettings extends PreferenceActivity implements
         
         /** Whether the shortcut has been seen already.  The array index is the shortcut. */
         SparseBooleanArray shortcutSeen = new SparseBooleanArray();
-        KeyCharacterMap keyMap = KeyCharacterMap.load(KeyCharacterMap.BUILT_IN_KEYBOARD);
+        KeyCharacterMap keyMap = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD);
 
         // Go through all the key codes and create a preference for the appropriate keys
         for (int keyCode = KeyEvent.getMaxKeyCode() - 1; keyCode >= 0; keyCode--) {
@@ -314,7 +314,7 @@ public class QuickLaunchSettings extends PreferenceActivity implements
             String intentUri = c.getString(intentColumn);
             PackageManager packageManager = getPackageManager();
             try {
-                Intent intent = Intent.getIntent(intentUri);
+                Intent intent = Intent.parseUri(intentUri, 0);
                 ResolveInfo info = packageManager.resolveActivity(intent, 0);
                 if (info != null) {
                     title = info.loadLabel(packageManager);

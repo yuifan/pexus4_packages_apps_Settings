@@ -16,108 +16,151 @@
 
 package com.android.settings;
 
-import android.content.ComponentName;
+import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
-import android.content.pm.PackageManager;
-import android.content.pm.ResolveInfo;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SELinux;
 import android.os.SystemClock;
 import android.os.SystemProperties;
+import android.os.UserHandle;
 import android.preference.Preference;
-import android.preference.PreferenceActivity;
 import android.preference.PreferenceGroup;
 import android.preference.PreferenceScreen;
-import android.provider.Settings;
 import android.util.Log;
-import android.view.MotionEvent;
+import android.widget.Toast;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.IOException;
-import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-public class DeviceInfoSettings extends PreferenceActivity {
-    private static final String TAG = "DeviceInfoSettings";
+public class DeviceInfoSettings extends SettingsPreferenceFragment {
+
+    private static final String LOG_TAG = "DeviceInfoSettings";
+
+    private static final String FILENAME_PROC_VERSION = "/proc/version";
+    private static final String FILENAME_MSV = "/sys/board_properties/soc/msv";
 
     private static final String KEY_CONTAINER = "container";
     private static final String KEY_TEAM = "team";
     private static final String KEY_CONTRIBUTORS = "contributors";
+    private static final String KEY_REGULATORY_INFO = "regulatory_info";
     private static final String KEY_TERMS = "terms";
     private static final String KEY_LICENSE = "license";
     private static final String KEY_COPYRIGHT = "copyright";
     private static final String KEY_SYSTEM_UPDATE_SETTINGS = "system_update_settings";
     private static final String PROPERTY_URL_SAFETYLEGAL = "ro.url.safetylegal";
+    private static final String PROPERTY_SELINUX_STATUS = "ro.build.selinux";
+    private static final String KEY_KERNEL_VERSION = "kernel_version";
+    private static final String KEY_BUILD_NUMBER = "build_number";
+    private static final String KEY_DEVICE_MODEL = "device_model";
+    private static final String KEY_SELINUX_STATUS = "selinux_status";
+    private static final String KEY_BASEBAND_VERSION = "baseband_version";
+    private static final String KEY_FIRMWARE_VERSION = "firmware_version";
     private static final String KEY_UPDATE_SETTING = "additional_system_update_settings";
+    private static final String KEY_EQUIPMENT_ID = "fcc_equipment_id";
+    private static final String PROPERTY_EQUIPMENT_ID = "ro.ril.fccid";
+
+    static final int TAPS_TO_BE_A_DEVELOPER = 7;
 
     long[] mHits = new long[3];
+    int mDevHitCountdown;
+    Toast mDevHitToast;
 
     @Override
-    protected void onCreate(Bundle icicle) {
+    public void onCreate(Bundle icicle) {
         super.onCreate(icicle);
 
         addPreferencesFromResource(R.xml.device_info_settings);
 
-        // If we don't have an IME tutorial, remove that option
-        String currentIme = Settings.Secure.getString(getContentResolver(),
-                Settings.Secure.DEFAULT_INPUT_METHOD);
-        ComponentName component = ComponentName.unflattenFromString(currentIme);
-        Intent imeIntent = new Intent(component.getPackageName() + ".tutorial");
-        PackageManager pm = getPackageManager();
-        List<ResolveInfo> tutorials = pm.queryIntentActivities(imeIntent, 0);
-        if(tutorials == null || tutorials.isEmpty()) {
-            getPreferenceScreen().removePreference(findPreference("system_tutorial"));
+        setStringSummary(KEY_FIRMWARE_VERSION, Build.VERSION.RELEASE);
+        findPreference(KEY_FIRMWARE_VERSION).setEnabled(true);
+        setValueSummary(KEY_BASEBAND_VERSION, "gsm.version.baseband");
+        setStringSummary(KEY_DEVICE_MODEL, Build.MODEL + getMsvSuffix());
+        setValueSummary(KEY_EQUIPMENT_ID, PROPERTY_EQUIPMENT_ID);
+        setStringSummary(KEY_DEVICE_MODEL, Build.MODEL);
+        setStringSummary(KEY_BUILD_NUMBER, Build.DISPLAY);
+        findPreference(KEY_BUILD_NUMBER).setEnabled(true);
+        findPreference(KEY_KERNEL_VERSION).setSummary(getFormattedKernelVersion());
+
+        if (!SELinux.isSELinuxEnabled()) {
+            String status = getResources().getString(R.string.selinux_status_disabled);
+            setStringSummary(KEY_SELINUX_STATUS, status);
+        } else if (!SELinux.isSELinuxEnforced()) {
+            String status = getResources().getString(R.string.selinux_status_permissive);
+            setStringSummary(KEY_SELINUX_STATUS, status);
         }
 
-        setStringSummary("firmware_version", Build.VERSION.RELEASE);
-        findPreference("firmware_version").setEnabled(true);
-        setValueSummary("baseband_version", "gsm.version.baseband");
-        setStringSummary("device_model", Build.MODEL);
-        setStringSummary("build_number", Build.DISPLAY);
-        findPreference("kernel_version").setSummary(getFormattedKernelVersion());
+        // Remove selinux information if property is not present
+        removePreferenceIfPropertyMissing(getPreferenceScreen(), KEY_SELINUX_STATUS,
+                PROPERTY_SELINUX_STATUS);
 
         // Remove Safety information preference if PROPERTY_URL_SAFETYLEGAL is not set
         removePreferenceIfPropertyMissing(getPreferenceScreen(), "safetylegal",
                 PROPERTY_URL_SAFETYLEGAL);
 
+        // Remove Equipment id preference if FCC ID is not set by RIL
+        removePreferenceIfPropertyMissing(getPreferenceScreen(), KEY_EQUIPMENT_ID,
+                PROPERTY_EQUIPMENT_ID);
+
+        // Remove Baseband version if wifi-only device
+        if (Utils.isWifiOnly(getActivity())) {
+            getPreferenceScreen().removePreference(findPreference(KEY_BASEBAND_VERSION));
+        }
+
         /*
          * Settings is a generic app and should not contain any device-specific
          * info.
          */
-
+        final Activity act = getActivity();
         // These are contained in the "container" preference group
         PreferenceGroup parentPreference = (PreferenceGroup) findPreference(KEY_CONTAINER);
-        Utils.updatePreferenceToSpecificActivityOrRemove(this, parentPreference, KEY_TERMS,
+        Utils.updatePreferenceToSpecificActivityOrRemove(act, parentPreference, KEY_TERMS,
                 Utils.UPDATE_PREFERENCE_FLAG_SET_TITLE_TO_MATCHING_ACTIVITY);
-        Utils.updatePreferenceToSpecificActivityOrRemove(this, parentPreference, KEY_LICENSE,
+        Utils.updatePreferenceToSpecificActivityOrRemove(act, parentPreference, KEY_LICENSE,
                 Utils.UPDATE_PREFERENCE_FLAG_SET_TITLE_TO_MATCHING_ACTIVITY);
-        Utils.updatePreferenceToSpecificActivityOrRemove(this, parentPreference, KEY_COPYRIGHT,
+        Utils.updatePreferenceToSpecificActivityOrRemove(act, parentPreference, KEY_COPYRIGHT,
                 Utils.UPDATE_PREFERENCE_FLAG_SET_TITLE_TO_MATCHING_ACTIVITY);
-        Utils.updatePreferenceToSpecificActivityOrRemove(this, parentPreference, KEY_TEAM,
+        Utils.updatePreferenceToSpecificActivityOrRemove(act, parentPreference, KEY_TEAM,
                 Utils.UPDATE_PREFERENCE_FLAG_SET_TITLE_TO_MATCHING_ACTIVITY);
 
         // These are contained by the root preference screen
         parentPreference = getPreferenceScreen();
-        Utils.updatePreferenceToSpecificActivityOrRemove(this, parentPreference,
-                KEY_SYSTEM_UPDATE_SETTINGS,
-                Utils.UPDATE_PREFERENCE_FLAG_SET_TITLE_TO_MATCHING_ACTIVITY);
-        Utils.updatePreferenceToSpecificActivityOrRemove(this, parentPreference, KEY_CONTRIBUTORS,
+        if (UserHandle.myUserId() == UserHandle.USER_OWNER) {
+            Utils.updatePreferenceToSpecificActivityOrRemove(act, parentPreference,
+                    KEY_SYSTEM_UPDATE_SETTINGS,
+                    Utils.UPDATE_PREFERENCE_FLAG_SET_TITLE_TO_MATCHING_ACTIVITY);
+        } else {
+            // Remove for secondary users
+            removePreference(KEY_SYSTEM_UPDATE_SETTINGS);
+        }
+        Utils.updatePreferenceToSpecificActivityOrRemove(act, parentPreference, KEY_CONTRIBUTORS,
                 Utils.UPDATE_PREFERENCE_FLAG_SET_TITLE_TO_MATCHING_ACTIVITY);
 
         // Read platform settings for additional system update setting
-        boolean mUpdateSettingAvailable =
-                getResources().getBoolean(R.bool.config_additional_system_update_setting_enable);
+        removePreferenceIfBoolFalse(KEY_UPDATE_SETTING,
+                R.bool.config_additional_system_update_setting_enable);
 
-        if(mUpdateSettingAvailable == false) {
-            getPreferenceScreen().removePreference(findPreference(KEY_UPDATE_SETTING));
-        }
+        // Remove regulatory information if not enabled.
+        removePreferenceIfBoolFalse(KEY_REGULATORY_INFO,
+                R.bool.config_show_regulatory_info);
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        mDevHitCountdown = getActivity().getSharedPreferences(DevelopmentSettings.PREF_FILE,
+                Context.MODE_PRIVATE).getBoolean(DevelopmentSettings.PREF_SHOW,
+                        android.os.Build.TYPE.equals("eng")) ? -1 : TAPS_TO_BE_A_DEVELOPER;
+        mDevHitToast = null;
     }
 
     @Override
     public boolean onPreferenceTreeClick(PreferenceScreen preferenceScreen, Preference preference) {
-        if (preference.getKey().equals("firmware_version")) {
+        if (preference.getKey().equals(KEY_FIRMWARE_VERSION)) {
             System.arraycopy(mHits, 1, mHits, 0, mHits.length-1);
             mHits[mHits.length-1] = SystemClock.uptimeMillis();
             if (mHits[0] >= (SystemClock.uptimeMillis()-500)) {
@@ -127,7 +170,39 @@ public class DeviceInfoSettings extends PreferenceActivity {
                 try {
                     startActivity(intent);
                 } catch (Exception e) {
+                    Log.e(LOG_TAG, "Unable to start activity " + intent.toString());
                 }
+            }
+        } else if (preference.getKey().equals(KEY_BUILD_NUMBER)) {
+            if (mDevHitCountdown > 0) {
+                mDevHitCountdown--;
+                if (mDevHitCountdown == 0) {
+                    getActivity().getSharedPreferences(DevelopmentSettings.PREF_FILE,
+                            Context.MODE_PRIVATE).edit().putBoolean(
+                                    DevelopmentSettings.PREF_SHOW, true).apply();
+                    if (mDevHitToast != null) {
+                        mDevHitToast.cancel();
+                    }
+                    mDevHitToast = Toast.makeText(getActivity(), R.string.show_dev_on,
+                            Toast.LENGTH_LONG);
+                    mDevHitToast.show();
+                } else if (mDevHitCountdown > 0
+                        && mDevHitCountdown < (TAPS_TO_BE_A_DEVELOPER-2)) {
+                    if (mDevHitToast != null) {
+                        mDevHitToast.cancel();
+                    }
+                    mDevHitToast = Toast.makeText(getActivity(), getResources().getQuantityString(
+                            R.plurals.show_dev_countdown, mDevHitCountdown, mDevHitCountdown),
+                            Toast.LENGTH_SHORT);
+                    mDevHitToast.show();
+                }
+            } else if (mDevHitCountdown < 0) {
+                if (mDevHitToast != null) {
+                    mDevHitToast.cancel();
+                }
+                mDevHitToast = Toast.makeText(getActivity(), R.string.show_dev_already,
+                        Toast.LENGTH_LONG);
+                mDevHitToast.show();
             }
         }
         return super.onPreferenceTreeClick(preferenceScreen, preference);
@@ -135,14 +210,22 @@ public class DeviceInfoSettings extends PreferenceActivity {
 
     private void removePreferenceIfPropertyMissing(PreferenceGroup preferenceGroup,
             String preference, String property ) {
-        if (SystemProperties.get(property).equals(""))
-        {
+        if (SystemProperties.get(property).equals("")) {
             // Property is missing so remove preference from group
             try {
                 preferenceGroup.removePreference(findPreference(preference));
             } catch (RuntimeException e) {
-                Log.d(TAG, "Property '" + property + "' missing and no '"
+                Log.d(LOG_TAG, "Property '" + property + "' missing and no '"
                         + preference + "' preference");
+            }
+        }
+    }
+
+    private void removePreferenceIfBoolFalse(String preference, int resId) {
+        if (!getResources().getBoolean(resId)) {
+            Preference pref = findPreference(preference);
+            if (pref != null) {
+                getPreferenceScreen().removePreference(pref);
             }
         }
     }
@@ -162,48 +245,31 @@ public class DeviceInfoSettings extends PreferenceActivity {
                     SystemProperties.get(property,
                             getResources().getString(R.string.device_info_default)));
         } catch (RuntimeException e) {
-
+            // No recovery
         }
     }
 
-    private String getFormattedKernelVersion() {
-        String procVersionStr;
-
+    /**
+     * Reads a line from the specified file.
+     * @param filename the file to read from
+     * @return the first line, if any.
+     * @throws IOException if the file couldn't be read
+     */
+    private static String readLine(String filename) throws IOException {
+        BufferedReader reader = new BufferedReader(new FileReader(filename), 256);
         try {
-            BufferedReader reader = new BufferedReader(new FileReader("/proc/version"), 256);
-            try {
-                procVersionStr = reader.readLine();
-            } finally {
-                reader.close();
-            }
+            return reader.readLine();
+        } finally {
+            reader.close();
+        }
+    }
 
-            final String PROC_VERSION_REGEX =
-                "\\w+\\s+" + /* ignore: Linux */
-                "\\w+\\s+" + /* ignore: version */
-                "([^\\s]+)\\s+" + /* group 1: 2.6.22-omap1 */
-                "\\(([^\\s@]+(?:@[^\\s.]+)?)[^)]*\\)\\s+" + /* group 2: (xxxxxx@xxxxx.constant) */
-                "\\((?:[^(]*\\([^)]*\\))?[^)]*\\)\\s+" + /* ignore: (gcc ..) */
-                "([^\\s]+)\\s+" + /* group 3: #26 */
-                "(?:PREEMPT\\s+)?" + /* ignore: PREEMPT (optional) */
-                "(.+)"; /* group 4: date */
+    public static String getFormattedKernelVersion() {
+        try {
+            return formatKernelVersion(readLine(FILENAME_PROC_VERSION));
 
-            Pattern p = Pattern.compile(PROC_VERSION_REGEX);
-            Matcher m = p.matcher(procVersionStr);
-
-            if (!m.matches()) {
-                Log.e(TAG, "Regex did not match on /proc/version: " + procVersionStr);
-                return "Unavailable";
-            } else if (m.groupCount() < 4) {
-                Log.e(TAG, "Regex match on /proc/version only returned " + m.groupCount()
-                        + " groups");
-                return "Unavailable";
-            } else {
-                return (new StringBuilder(m.group(1)).append("\n").append(
-                        m.group(2)).append(" ").append(m.group(3)).append("\n")
-                        .append(m.group(4))).toString();
-            }
         } catch (IOException e) {
-            Log.e(TAG,
+            Log.e(LOG_TAG,
                 "IO Exception when getting kernel version for Device Info screen",
                 e);
 
@@ -211,4 +277,52 @@ public class DeviceInfoSettings extends PreferenceActivity {
         }
     }
 
+    public static String formatKernelVersion(String rawKernelVersion) {
+        // Example (see tests for more):
+        // Linux version 3.0.31-g6fb96c9 (android-build@xxx.xxx.xxx.xxx.com) \
+        //     (gcc version 4.6.x-xxx 20120106 (prerelease) (GCC) ) #1 SMP PREEMPT \
+        //     Thu Jun 28 11:02:39 PDT 2012
+
+        final String PROC_VERSION_REGEX =
+            "Linux version (\\S+) " + /* group 1: "3.0.31-g6fb96c9" */
+            "\\((\\S+?)\\) " +        /* group 2: "x@y.com" (kernel builder) */
+            "(?:\\(gcc.+? \\)) " +    /* ignore: GCC version information */
+            "(#\\d+) " +              /* group 3: "#1" */
+            "(?:.*?)?" +              /* ignore: optional SMP, PREEMPT, and any CONFIG_FLAGS */
+            "((Sun|Mon|Tue|Wed|Thu|Fri|Sat).+)"; /* group 4: "Thu Jun 28 11:02:39 PDT 2012" */
+
+        Matcher m = Pattern.compile(PROC_VERSION_REGEX).matcher(rawKernelVersion);
+        if (!m.matches()) {
+            Log.e(LOG_TAG, "Regex did not match on /proc/version: " + rawKernelVersion);
+            return "Unavailable";
+        } else if (m.groupCount() < 4) {
+            Log.e(LOG_TAG, "Regex match on /proc/version only returned " + m.groupCount()
+                    + " groups");
+            return "Unavailable";
+        }
+        return m.group(1) + "\n" +                 // 3.0.31-g6fb96c9
+            m.group(2) + " " + m.group(3) + "\n" + // x@y.com #1
+            m.group(4);                            // Thu Jun 28 11:02:39 PDT 2012
+    }
+
+    /**
+     * Returns " (ENGINEERING)" if the msv file has a zero value, else returns "".
+     * @return a string to append to the model number description.
+     */
+    private String getMsvSuffix() {
+        // Production devices should have a non-zero value. If we can't read it, assume it's a
+        // production device so that we don't accidentally show that it's an ENGINEERING device.
+        try {
+            String msv = readLine(FILENAME_MSV);
+            // Parse as a hex number. If it evaluates to a zero, then it's an engineering build.
+            if (Long.parseLong(msv, 16) == 0) {
+                return " (ENGINEERING)";
+            }
+        } catch (IOException ioe) {
+            // Fail quietly, as the file may not exist on some devices.
+        } catch (NumberFormatException nfe) {
+            // Fail quietly, returning empty string should be sufficient
+        }
+        return "";
+    }
 }

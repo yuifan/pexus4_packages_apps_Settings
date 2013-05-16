@@ -93,7 +93,7 @@ class BatterySipper implements Comparable<BatterySipper> {
 
     public int compareTo(BatterySipper other) {
         // Return the flipped value because we want the items in descending order
-        return (int) (other.getSortValue() - getSortValue());
+        return Double.compare(other.getSortValue(), getSortValue());
     }
 
     void getQuickNameIconForUid(Uid uidObj) {
@@ -107,7 +107,6 @@ class BatterySipper implements Comparable<BatterySipper> {
             return;
         }
         PackageManager pm = mContext.getPackageManager();
-        final Drawable defaultActivityIcon = pm.getDefaultActivityIcon();
         String[] packages = pm.getPackagesForUid(uid);
         icon = pm.getDefaultActivityIcon();
         if (packages == null) {

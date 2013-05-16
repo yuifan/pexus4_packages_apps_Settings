@@ -201,7 +201,7 @@ public class ActivityPicker extends AlertActivity implements
         /**
          * Item that appears in a {@link PickAdapter} list.
          */
-        public static class Item {
+        public static class Item implements AppWidgetLoader.LabelledItem {
             protected static IconResizer sResizer;
             
             protected IconResizer getResizer(Context context) {
@@ -261,6 +261,10 @@ public class ActivityPicker extends AlertActivity implements
                     intent.putExtra(Intent.EXTRA_SHORTCUT_NAME, label);
                 }
                 return intent;
+            }
+
+            public CharSequence getLabel() {
+                return label;
             }
         }
         
@@ -399,6 +403,7 @@ public class ActivityPicker extends AlertActivity implements
                         //noinspection deprecation
                         icon = new BitmapDrawable(thumb);
                         ((BitmapDrawable) icon).setTargetDensity(mMetrics);
+                        canvas.setBitmap(null);
                     } else if (iconWidth < width && iconHeight < height) {
                         final Bitmap.Config c = Bitmap.Config.ARGB_8888;
                         final Bitmap thumb = Bitmap.createBitmap(mIconWidth, mIconHeight, c);
@@ -413,6 +418,7 @@ public class ActivityPicker extends AlertActivity implements
                         //noinspection deprecation
                         icon = new BitmapDrawable(thumb);
                         ((BitmapDrawable) icon).setTargetDensity(mMetrics);
+                        canvas.setBitmap(null);
                     }
                 }
     
@@ -469,5 +475,5 @@ public class ActivityPicker extends AlertActivity implements
         public int getOpacity() {
             return PixelFormat.TRANSLUCENT;
         }
-    }    
+    }
 }

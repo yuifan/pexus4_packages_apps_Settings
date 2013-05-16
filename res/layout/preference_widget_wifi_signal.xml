@@ -18,6 +18,5 @@
     android:id="@+id/signal" 
     android:layout_width="wrap_content"
     android:layout_height="wrap_content"
-    android:layout_marginRight="4sp"
-    android:layout_gravity="center_vertical"
-    android:src="@drawable/wifi_signal" />
+    android:src="@drawable/wifi_signal"
+    android:contentDescription="@null" />
